@@ -111,24 +111,41 @@ These settings are **not part of the extension** — they're VSCode core, and th
 
 ## Architecture
 
-The extension is a single TypeScript file (~330 lines) bundled to ~7 KB with esbuild.
+A small, layered TypeScript codebase bundled to ~11 KB with esbuild. Dependencies flow one way — `config ← git ← model ← tree / commands ← extension` — and the `git` and `model` layers never import `vscode`, so they're unit-testable in isolation.
 
 ```
-src/extension.ts
-├── Git helpers                  exec git status / branch lookups
-├── openDiffForFile()            opens working-tree-vs-HEAD diff for a file
-├── WorkspaceChangesProvider     vscode.TreeDataProvider impl
-├── RepoTreeItem / FileTreeItem  typed TreeItem subclasses
-├── shouldIgnorePath()           filter for the broad fs watcher
-└── activate()                   wires everything up
+src/
+├── config.ts          brand + tuning constants (view id, command ids, scan depth)
+├── extension.ts       activate(): wiring only — provider, tree view, watchers, commands
+├── git/
+│   ├── exec.ts        execGit / showBlob / runGit — the process layer
+│   ├── status.ts      FileStatus + BumpRef types, line parsers, status/branch/bump queries
+│   └── discover.ts    discoverRepos() — aggregator-aware repo walk
+├── model/
+│   └── scan.ts        scanWorkspace() → nested Folder → Repo → FileChange model (no vscode)
+├── tree/
+│   ├── items.ts       Folder / Repo / File TreeItem subclasses
+│   └── provider.ts    WorkspaceChangesProvider — maps the model to a 3-level tree
+├── commands/
+│   ├── diff.ts        openDiffForFile() — working-tree and bump (committed-blob) diffs
+│   ├── discard.ts     discardChanges / discardAllChanges
+│   └── register.ts    binds command ids to handlers
+└── watch/
+    └── watcher.ts     shouldIgnorePath() + debounced refresh wiring
 ```
+
+**Aggregator / superproject support.** Beyond flat side-by-side meta-repos, the extension also handles git submodules nested under a parent repo (including linked worktrees whose `.git` is a file):
+
+- **Aggregator-aware discovery** — the workspace-folder root is treated as an aggregator (recorded _and_ descended into), and nested repos are found as leaves at any depth, instead of short-circuiting on the root's own `.git`.
+- **Nested tree** — submodules render _under_ their folder root, with the aggregator's own files directly beneath it; gitlink "pointer" rows are filtered.
+- **Bump rows** — a submodule whose HEAD is ahead of the recorded gitlink (committed work, clean worktree) surfaces as a `↑ bump` node, expandable to the files changed across `recorded..HEAD`, click-to-diff on the committed blobs.
 
 Key technical decisions:
 
-- **Parallel git status** via `Promise.all` — listing 19 repos sequentially takes ~190 ms (visible loading bar); parallel is ~10 ms (invisible).
+- **Parallel git status** via `Promise.all` — listing dozens of repos sequentially shows a loading bar; parallel is ~the slowest single repo.
 - **Two-source refresh** — VSCode-internal events (`onDidSaveTextDocument`, `onDidCreateFiles`, etc.) fire fast for in-editor saves; a broad `createFileSystemWatcher('**/*')` catches changes from external tools (terminal git, AI agents, other editors). `shouldIgnorePath()` filters out `.git/` internals, `node_modules/`, build outputs, `*.tsbuildinfo`, and OS metadata to prevent refresh churn. Both paths feed a single 500 ms debounced refresh.
-- **Stable TreeItem IDs** (`repo:<path>` and `file:<repo>:<file>`) — required for `tree.reveal()` to work and for VSCode to preserve expansion state across refreshes.
-- **`getParent()` implementation** — required for `tree.reveal()` to function at all; without it, expand-all silently no-ops.
+- **Stable TreeItem IDs** (`folder:<path>`, `repo:<path>`, `file:<repo>:<file>`) — required for `tree.reveal()` to work and for VSCode to preserve expansion state across refreshes.
+- **`getParent()` via parent pointers** — required for `tree.reveal()` / expand-all to function; without it, expand-all silently no-ops.
 - **HEAD blobs in `<repo>/.git/metarepo-sc-tmp/`** — VSCode's default `**/.git` exclusion automatically hides them from Explorer, search, and the TypeScript language service. Filename matches the working file so diff tab titles are clean.
 - **Untracked directory short-circuit** — `git status --porcelain --untracked-files=all` expands directories to their files, but the click handler still defends against directory targets in case any slip through (e.g. submodules).
 
